@@ -1,5 +1,6 @@
 from django.conf.urls.defaults import *
 from django.conf import settings
+from django.contrib.auth.decorators import login_required
 from django.core import urlresolvers
 from django.views.generic.simple import direct_to_template
 from django.views.generic import RedirectView
@@ -72,7 +73,7 @@ urlpatterns += patterns('mapstory.views',
     (r'^data/create_annotations_layer/(?P<mapid>\d+)$','create_annotations_layer'),
     url(r'^mapstory/donate$',direct_to_template, {"template":"mapstory/donate.html"},name='donate'),
     url(r'^mapstory/thanks$',direct_to_template, {"template":"mapstory/thanks.html"}),
-    url(r'^mapstory/invites$',direct_to_template, {"template":"mapstory/invites.html"}, name='invites_page'),
+    url(r'^mapstory/invites$',login_required(direct_to_template), {"template":"mapstory/invites.html"}, name='invites_page'),
     url(r'^mapstory/invites/preview$', 'invite_preview', name='invite_preview'),
     url(r'^mapstory/alerts$','alerts',name='alerts'),
     url(r'^mapstory/tile/(?P<mapid>\d+)$','map_tile',name='map_tile'),
@@ -82,6 +83,7 @@ urlpatterns += patterns('mapstory.views',
     url(r'^mapstory/resource/(?P<resource>[-\w]+)$','resource_detail',name='mapstory_resource'),
     url(r'^mapstory/how-to$','how_to',name='how_to'),
     url(r'^mapstory/manual$','manual',name='mapstory_manual'),
+    url(r'^mapstory/admin-manual$','admin_manual',name='mapstory_admin_manual'),
     url(r'^data/style/upload$','upload_style',name='upload_style'),
     
     # semi-temp urls
