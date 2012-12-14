@@ -1,11 +1,13 @@
 from django import template
 from django.template import loader
+from django.core.paginator import Page
 from django.core.urlresolvers import reverse
 from django.contrib.auth.models import User
 from django.contrib.staticfiles.templatetags import staticfiles
 from django.conf import settings
 from geonode.maps.models import Map
 from geonode.maps.models import Layer
+from geonode.maps.models import ALL_LANGUAGES
 from mapstory.models import Section
 from mapstory.models import Favorite
 from mapstory.models import PublishingStatus
@@ -175,39 +177,26 @@ class CommentsSectionNode(dialogos_tags.ThreadedCommentsNode):
     template_name = 'maps/_widget_comments.html'
 
 
-@register.tag
-def related_mapstories(parse, token):
-    try:
-        tokens = token.split_contents()
-        tag_name = tokens.pop(0)
-        obj_name = tokens.pop(0)
-    except ValueError:
-        raise template.TemplateSyntaxError, "%r tag requires a single argument" % token.contents.split()[0]
-    return RelatedStoriesNode(obj_name)
+@register.simple_tag
+def related_mapstories(obj):
+    if isinstance(obj, Section):
+        topics = obj.topics.all()
+    else:
+        topics = list(obj.topic_set.all())
+    result = ""
+    template_name = "mapstory/_story_tile_left.html"
 
-class RelatedStoriesNode(template.Node):
-    def __init__(self, obj_name):
-        self.obj_name = obj_name
-    def render(self, context):
-        obj = context[self.obj_name]
-        if isinstance(obj, Section):
-            topics = obj.topics.all()
-        else:
-            topics = list(obj.topic_set.all())
-        result = ""
-        template_name = "mapstory/_story_tile_left.html"
-        
-        # @todo gather from all topics and respective sections
-        sections = topics and topics[0].section_set.all() or None
-        if topics and sections:
-            sec = sections[0]
-            maps = sec.get_maps()
-            if isinstance(obj, Map) and obj in maps:
-                maps.remove(obj)
-            result = "\n".join((
-                loader.render_to_string(template_name,{"map": m,"when":m.last_modified}) for m in maps
-            ))
-        return result
+    # @todo gather from all topics and respective sections
+    sections = topics and topics[0].section_set.all() or None
+    if topics and sections:
+        sec = sections[0]
+        maps = sec.get_maps()
+        if isinstance(obj, Map):
+            maps = maps.exclude(id=obj.id)
+        result = "\n".join((
+            loader.render_to_string(template_name,{"map": m,"when":m.last_modified}) for m in maps
+        ))
+    return result
     
 @register.tag
 def favorites(parse, token):
@@ -308,6 +297,63 @@ class ByStoryTellerNode(template.Node):
             'layers':layers
         })
         
+_link_template = "<a href='%s'>%s</a>"
+_pt_link_template = "%s (%s)"
+absolutize = lambda u: u if u.startswith("http:") else settings.SITEURL[:-1] + u
+def _activity_link(subject, plain_text=False):
+    object_name = subject.__class__._meta.object_name
+    if object_name == 'Layer':
+        parts = absolutize(subject.get_absolute_url()), "the StoryLayer '%s'" % subject.title
+    elif object_name == 'Map':
+        parts = absolutize(subject.get_absolute_url()), "the MapStory '%s'" % subject.title
+    else:
+        return subject
+    return (_pt_link_template if plain_text else _link_template) % parts
+
+@register.simple_tag
+def activity_item(action, show_actor_link=True, plain_text=False):
+    link_tmpl = _pt_link_template if plain_text else _link_template
+    username = action.actor.get_full_name() or action.actor.username
+    if show_actor_link:
+        username = link_tmpl % (absolutize(action.actor.get_absolute_url()), username)
+    subject = action.action_object
+    object_name = subject.__class__._meta.object_name
+    verb = action.verb
+    if object_name == 'Comment':
+        if action.target:
+            comment_link = link_tmpl % (absolutize(subject.content_object.get_absolute_url()) + "#comment-%s" % subject.id, ' a comment')
+            subject = 'to a %s on %s' % (comment_link, _activity_link(subject.content_object, plain_text))
+        else:
+            subject = 'on ' + _activity_link(subject.content_object, plain_text)
+    elif object_name == 'Rating':
+        verb = 'gave'
+        subject = '%s a rating of %s' % (_activity_link(subject.content_object,plain_text), subject.rating)
+    else:
+        subject = _activity_link(subject)
+    
+    ctx = dict(
+        verb= verb,
+        timestamp = action.timestamp,
+        ago = action.timesince,
+        user = username,
+        subject = subject
+    )
+    template = 'mapstory/_activity_item.%s' % ('txt' if plain_text else 'html')
+    # user, verb, subject, timestamp, ago
+    return loader.render_to_string(template, ctx)
+
+@register.simple_tag
+def activity_notifier(user):
+    if user.is_authenticated():
+        cnted = user.useractivity.other_actor_actions.count()
+        if cnted:
+            return '<span title="Recent Activity" class="actnot">(%s)</span>' % cnted
+
+@register.simple_tag
+def layer_language_selector(layer):
+    s = ("selected='selected' ",)
+    return "<select name='layer-language'>%s</select>" % "".join(['<option %svalue="%s">%s</option>' % (s + l if layer.language == l[0] else (' ',) + l) for l in ALL_LANGUAGES])
+        
 @register.simple_tag
 def admin_manual():
     url = reverse('mapstory_admin_manual')
@@ -326,8 +372,26 @@ def manual_include(path):
 @register.simple_tag
 def warn_status(req, obj):
     if req.user.is_authenticated() and obj.publish.status == PUBLISHING_STATUS_PRIVATE:
-        return loader.render_to_string('maps/_warn_status.html',{})
+        return loader.render_to_string('maps/_warn_status.html', {})
     return ""
+
+@register.simple_tag
+def warn_missing_thumb(obj):
+    if not obj.get_thumbnail():
+        return loader.render_to_string('maps/_warn_thumbnail.html', {})
+    return ""
+
+@register.simple_tag
+def pagination(pager, url_name, *args):
+    '''pager could be a page or pagination object.'''
+    url = reverse(url_name, args=args)
+    if not hasattr(pager, 'number'):
+        # we're on 'page 0' - lazy load
+        pager = Page([], 0, pager)
+    return loader.render_to_string('_pagination.html', {'page' : pager, 'url': url})
+
+def user_activity_email_prefs(user):
+    return loader.render_to_string('mapstory/user_activity_email_prefs.html',{'user': user})
 
 # @todo - make geonode location play better
 if settings.GEONODE_CLIENT_LOCATION.startswith("http"):

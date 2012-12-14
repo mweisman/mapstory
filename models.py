@@ -7,6 +7,7 @@ import time
 
 from django.conf import settings
 from django.core.cache import cache
+from django.core.paginator import Paginator
 from django.db import models
 from django.db.models import Count
 from django.db.models import signals
@@ -94,6 +95,22 @@ def get_ratings(model):
     return results
 
 
+def get_related_stories(obj):
+    if isinstance(obj, Section):
+        topics = obj.topics.all()
+    else:
+        topics = list(obj.topic_set.all())
+    maps = []
+    # @todo gather from all topics and respective sections
+    sections = topics and topics[0].section_set.all() or None
+    if topics and sections:
+        sec = sections[0]
+        maps = sec.get_maps()
+        if isinstance(obj, Map) and obj in maps:
+            maps.remove(obj)
+    return list(maps)
+
+
 class SectionManager(models.Manager):
     def sections_with_maps(self):
         '''@todo this is broken - Get only those sections that have maps'''
@@ -133,19 +150,20 @@ class Section(models.Model):
     topics = models.ManyToManyField(Topic,blank=True)
     order = models.IntegerField(null=True,blank=True)
     
-    def _children(self, att, **kw):
-        field = lambda t: getattr(t,att).filter(**kw)
-        return set(chain(*[ field(t) for t in self.topics.all()]))
+    def _children(self, model, **kw):
+        query = model.objects.filter(**kw)
+        return query.filter(topic__in=self.topics.all())
     
     def all_children(self):
-        x = self.get_maps() | self.get_layers()
-        return x
+        ch = list(self.get_maps())
+        ch.extend(self.get_layers())
+        return ch
     
     def get_maps(self):
-        return self._children('maps', publish__status=PUBLISHING_STATUS_PUBLIC)
+        return self._children(Map, publish__status=PUBLISHING_STATUS_PUBLIC)
         
     def get_layers(self):
-        return self._children('layers', publish__status=PUBLISHING_STATUS_PUBLIC)
+        return self._children(Layer, publish__status=PUBLISHING_STATUS_PUBLIC)
     
     def save(self,*args,**kw):
         slugtext = self.name.replace('&','and')
@@ -153,6 +171,10 @@ class Section(models.Model):
         if self.order is None:
             self.order = self.id
         models.Model.save(self)
+        
+    def maps_pager(self, page_size=6):
+        '''make it easy to get a paginator in a template'''
+        return Paginator(list(self.get_maps()), page_size)
         
     def get_absolute_url(self):
         return reverse('section_detail',args=[self.slug])
@@ -190,7 +212,18 @@ class VideoLink(Link):
     text = models.CharField(max_length=350)
     publish = models.BooleanField(default=False)
     location = models.CharField(max_length=2, choices=_VIDEO_LOCATION_CHOICES)
-    
+
+_NOTIFICATION_PREFERENCES = [
+    ('E','Email'),
+    ('S','Daily Summary'),
+    ('N','None')
+]
+class UserActivity(models.Model):
+    user = models.OneToOneField(User)
+    # automatically tracked actions
+    other_actor_actions = models.ManyToManyField('actstream.Action')
+    notification_preference = models.CharField(max_length=1, default='N', choices=_NOTIFICATION_PREFERENCES)
+
 class ContactDetail(Contact):
     '''Additional User details'''
     blurb = models.CharField(max_length=140, null=True)
@@ -302,12 +335,12 @@ class PublishingStatus(models.Model):
             layers = self.map.local_layers
             owner = self.map.owner
             if len(set([owner]) | set([l.owner for l in layers])) > 1:
-                return [ l for l in layers if l.owner == owner]
+                return [ l for l in layers if l.owner == owner ]
 
-    def update_related(self):
+    def update_related(self, ignore_owner=False):
         if self.map:
             for l in self.map.local_layers:
-                if l.owner == self.map.owner:
+                if ignore_owner or l.owner == self.map.owner:
                     l.publish.status = self.status
                     l.publish.save()
 
@@ -318,8 +351,21 @@ class PublishingStatus(models.Model):
             level = obj.LEVEL_NONE
         obj.set_gen_level(ANONYMOUS_USERS, level)
         obj.set_gen_level(AUTHENTICATED_USERS, level)
-        obj.set_user_level(obj.owner, obj.LEVEL_ADMIN)
+        if obj.owner: # usually won't happen except in fixture loading?
+            obj.set_user_level(obj.owner, obj.LEVEL_ADMIN)
         models.Model.save(self,*args)
+        
+        
+def audit_layer_metadata(layer):
+    '''determine if metadata is complete to allow publishing'''
+    return all([
+        layer.abstract,
+        layer.purpose,
+        layer.keywords,
+        layer.language,
+        layer.supplemental_information,
+        layer.data_quality_statement
+    ]) and layer.topic_set.count()
 
     
 def create_profile(instance, sender, **kw):
@@ -344,7 +390,7 @@ def create_hitcount(instance, sender, **kw):
         HitCount.objects.create(content_type=content_type, object_pk=instance.pk)
         
 def clear_acl_cache(instance, sender, **kw):
-    if kw['created']:
+    if kw['created'] and instance.owner:
         # this will only handle the owner's cached acls - other users will be
         # out of luck for the timeout period - likely not to be an issue
         key = 'layer_acls_%s' % instance.owner.id
@@ -354,7 +400,13 @@ def clear_acl_cache(instance, sender, **kw):
 def remove_favorites(instance, sender, **kw):
     ct = ContentType.objects.get_for_model(instance)
     Favorite.objects.filter(content_type=ct, object_id=instance.id).delete()
+    
+def create_user_activity(sender, instance, created, **kw):
+    if created:
+        UserActivity.objects.create(user=instance)
+        
 
+signals.post_save.connect(create_user_activity, sender=User)
 
 # make sure any favorites are also deleted
 signals.pre_delete.connect(remove_favorites, sender=Map)
