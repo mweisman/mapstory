@@ -4,6 +4,8 @@ import operator
 import re
 import logging
 import time
+import urllib
+import json
 
 from django.conf import settings
 from django.core.cache import cache
@@ -16,6 +18,7 @@ from django.contrib.contenttypes.models import ContentType
 from django.contrib.contenttypes import generic
 from django.core.urlresolvers import reverse
 from django.template import defaultfilters
+from django.utils.hashcompat import md5_constructor
 
 from django.contrib.auth.models import User
 
@@ -186,12 +189,15 @@ class Section(models.Model):
 class Link(models.Model):
     name = models.CharField(max_length=64)
     href = models.CharField(max_length=256)
-    
+    order = models.IntegerField(default=0, blank=True, null=True)
+
 _VIDEO_LOCATION_FRONT_PAGE = 'FP'
 _VIDEO_LOCATION_HOW_TO = 'HT'
+_VIDEO_LOCATION_REFLECTIONS = 'RF'
 _VIDEO_LOCATION_CHOICES = [
     (_VIDEO_LOCATION_FRONT_PAGE,'Front Page'),
-    (_VIDEO_LOCATION_HOW_TO,'How To')
+    (_VIDEO_LOCATION_HOW_TO,'How To'),
+    (_VIDEO_LOCATION_REFLECTIONS,'Reflections')
 ]
     
 class VideoLinkManager(models.Manager):
@@ -204,6 +210,8 @@ class VideoLinkManager(models.Manager):
         return random.choice(videos)
     def how_to_videos(self):
         return VideoLink.objects.filter(publish=True,location=_VIDEO_LOCATION_HOW_TO)
+    def reflections_videos(self):
+        return VideoLink.objects.filter(publish=True,location=_VIDEO_LOCATION_REFLECTIONS)
 
 class VideoLink(Link):
     objects = VideoLinkManager()
@@ -224,6 +232,7 @@ class UserActivity(models.Model):
     other_actor_actions = models.ManyToManyField('actstream.Action')
     notification_preference = models.CharField(max_length=1, default='N', choices=_NOTIFICATION_PREFERENCES)
 
+
 class ContactDetail(Contact):
     '''Additional User details'''
     blurb = models.CharField(max_length=140, null=True)
@@ -231,7 +240,49 @@ class ContactDetail(Contact):
     education = models.CharField(max_length=512, null=True, blank=True)
     expertise = models.CharField(max_length=256, null=True, blank=True)
     links = models.ManyToManyField(Link)
-    
+
+    def audit(self):
+        '''return a list of what is needed to 'complete' the profile'''
+        incomplete = []
+        if self._has_avatar():
+            incomplete.append('Picture/Avatar')
+        if not all([self.user.first_name, self.user.last_name]):
+            incomplete.append('Full Name')
+        if not self.blurb:
+            incomplete.append('Blurb')
+        return incomplete
+
+    def _has_avatar(self):
+        cnt = self.user.avatar_set.filter(primary=True).count()
+        if cnt > 0: return True
+        md5 = md5_constructor(self.user.email).hexdigest()
+        url = "http://en.gravatar.com/%s.json" % md5
+        try:
+            # @todo be nicer if this fails?
+            resp = urllib.urlopen(url)
+            json.loads(resp.read())
+            return True
+        except:
+            return False
+
+    def update_audit(self):
+        incomplete = self.audit()
+        if incomplete:
+            pi, _ = ProfileIncomplete.objects.get_or_create(user=self.user)
+            pi.message = ('Please ensure the following '
+            'fields are complete: %s'
+            ) % ', '.join(incomplete)
+            pi.save()
+        else:
+            ProfileIncomplete.objects.filter(user=self.user_id).delete()
+
+
+class ProfileIncomplete(models.Model):
+    '''Track incomplete user profiles'''
+    user = models.OneToOneField(User)
+    message = models.TextField()
+
+
 class Resource(models.Model):
     name = models.CharField(max_length=64)
     slug = models.SlugField(max_length=64,blank=True)
@@ -247,27 +298,27 @@ class Resource(models.Model):
         
     def get_absolute_url(self):
         return reverse('mapstory_resource',args=[self.slug])
-    
+
+
 class FavoriteManager(models.Manager):
-    
+
     def favorites_for_user(self, user):
         return self.filter(user=user)
-    
+
     def favorite_maps_for_user(self, user):
         content_type = ContentType.objects.get_for_model(Map)
         return self.favorites_for_user(user).filter(content_type=content_type)
-    
+
     def create_favorite(self, content_object, user):
         content_type = ContentType.objects.get_for_model(type(content_object))
-        favorite = Favorite(
+        favorite, _ = self.get_or_create(
             user=user,
             content_type=content_type,
             object_id=content_object.pk,
-            content_object=content_object,
             )
-        favorite.save()
         return favorite
-    
+
+
 class Favorite(models.Model):
     user = models.ForeignKey(User)
     content_type = models.ForeignKey(ContentType)
@@ -315,6 +366,8 @@ class PublishingStatusMananger(models.Manager):
     def set_status(self, obj, status):
         stat = self.get_or_create_for(obj)
         stat.status = status
+        # verify a valid status
+        stat.clean_fields()
         stat.save()
 
 class PublishingStatus(models.Model):
@@ -326,8 +379,8 @@ class PublishingStatus(models.Model):
     
     objects = PublishingStatusMananger()
     
-    map = models.OneToOneField(Map,related_name='publish',null=True)
-    layer = models.OneToOneField(Layer,related_name='publish',null=True)
+    map = models.OneToOneField(Map,related_name='publish', null=True, blank=True)
+    layer = models.OneToOneField(Layer,related_name='publish', null=True, blank=True)
     status = models.CharField(max_length=8,choices=PUBLISHING_STATUS_CHOICES,default=PUBLISHING_STATUS_PRIVATE)
     
     def check_related(self):
@@ -342,10 +395,13 @@ class PublishingStatus(models.Model):
             for l in self.map.local_layers:
                 if ignore_owner or l.owner == self.map.owner:
                     l.publish.status = self.status
+                    # verify a valid status
+                    l.publish.clean_fields()
                     l.publish.save()
 
     def save(self,*args,**kw):
         obj = self.layer or self.map
+        if not obj: raise Exception('invalid publish status, no obj')
         level = obj.LEVEL_READ
         if self.status == PUBLISHING_STATUS_PRIVATE:
             level = obj.LEVEL_NONE
@@ -353,24 +409,27 @@ class PublishingStatus(models.Model):
         obj.set_gen_level(AUTHENTICATED_USERS, level)
         if obj.owner: # usually won't happen except in fixture loading?
             obj.set_user_level(obj.owner, obj.LEVEL_ADMIN)
-        models.Model.save(self,*args)
+        models.Model.save(self, *args)
         
         
 def audit_layer_metadata(layer):
     '''determine if metadata is complete to allow publishing'''
     return all([
+        layer.title,
         layer.abstract,
         layer.purpose,
-        layer.keywords,
+        layer.keyword_list(),
         layer.language,
         layer.supplemental_information,
-        layer.data_quality_statement
+        layer.data_quality_statement,
+        layer.topic_set.all()
     ]) and layer.topic_set.count()
 
     
-def create_profile(instance, sender, **kw):
+def user_saved(instance, sender, **kw):
     if kw['created']:
-        ContactDetail.objects.create(user = instance)
+        cd = ContactDetail.objects.create(user = instance)
+        cd.update_audit()
 
 def create_publishing_status(instance, sender, **kw):
     if kw['created']:
@@ -379,11 +438,13 @@ def create_publishing_status(instance, sender, **kw):
 def set_publishing_private(**kw):
     instance = kw.get('layer')
     PublishingStatus.objects.set_status(instance, PUBLISHING_STATUS_PRIVATE)
-    
+
+
 def configure_gwc(**kw):
     instance = kw.get('layer')
-    gwc_config.configure_layer(instance.typename)
-        
+    gwc_config.configure_layer(instance, cache_secs=60)
+
+
 def create_hitcount(instance, sender, **kw):
     if kw['created']:
         content_type = ContentType.objects.get_for_model(instance)
@@ -412,7 +473,7 @@ signals.post_save.connect(create_user_activity, sender=User)
 signals.pre_delete.connect(remove_favorites, sender=Map)
 signals.pre_delete.connect(remove_favorites, sender=Layer)
 
-signals.post_save.connect(create_profile, sender=User)
+signals.post_save.connect(user_saved, sender=User)
 signals.post_save.connect(create_publishing_status, sender=Map)
 signals.post_save.connect(create_publishing_status, sender=Layer)
 # @annoyatron - core upload sets permissions after saving the layer

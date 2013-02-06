@@ -28,6 +28,7 @@ from django.shortcuts import get_object_or_404
 from django.views.decorators.http import require_POST
 from django.contrib.auth.decorators import login_required
 from django.http import HttpResponse
+from django.http import HttpResponseRedirect
 from django.shortcuts import render_to_response
 from django.template import RequestContext
 from django.template import loader
@@ -65,6 +66,11 @@ def index(req):
 def how_to(req):
     return render_to_response('mapstory/how_to.html', RequestContext(req,{
         'videos' : models.VideoLink.objects.how_to_videos()
+    }))
+    
+def reflections(req):
+    return render_to_response('mapstory/reflections.html', RequestContext(req,{
+        'videos' : models.VideoLink.objects.reflections_videos()
     }))
     
 def admin_manual(req):
@@ -199,6 +205,12 @@ def favoriteslist(req):
     }
     return render_to_response("mapstory/_widget_favorites.html",ctx)
 
+
+def _error_response(message, extra='', extra_class=''):
+    return ("<div class='mrg-top errorlist'><p class='alert %s'>%s</p>%s</div>" %
+        (extra_class, message, extra))
+
+
 @login_required
 def layer_metadata(request, layername):
     '''ugh, override the default'''
@@ -218,11 +230,24 @@ def layer_metadata(request, layername):
             layer.language = form.cleaned_data['language']
             layer.supplemental_information = form.cleaned_data['supplemental_information']
             layer.data_quality_statement = form.cleaned_data['data_quality_statement']
+            if not models.audit_layer_metadata(layer):
+                msg = _error_response((
+                    'The metadata was updated but is incomplete.<br>'
+                    'You will not be able to publish until completed.'
+                ))
+                # roll back to private if changes have invalidated metadata
+                models.PublishingStatus.objects.set_status(layer, 'Private')
+                resp = HttpResponse(msg, status=400)
+            else:
+                resp = HttpResponse('OK')
             layer.save()
-            return HttpResponse('OK')
+            return resp
         else:
-            errors = "<div class='errorlist'><p class='alert alert-error'>There were errors in the data provided:</p>%s</div>" % form.errors.as_ul()
+            errors = _error_response('There were errors in the data provided:',
+                                     form.errors.as_ul(), 'alert-error')
             return HttpResponse(errors, status=400)
+    # old 'geonode' api, just redirect to layer page
+    return HttpResponseRedirect(reverse('data_detail', args=[layer.typename]))
     
 @login_required
 def favorite(req, layer_or_map, id):
@@ -238,6 +263,7 @@ def delete_favorite(req, id):
     models.Favorite.objects.get(user=req.user, pk=id).delete()
     return HttpResponse('OK', status=200)
 
+
 @login_required
 def publish_status(req, layer_or_map, layer_or_map_id):
     if req.method != 'POST':
@@ -245,8 +271,11 @@ def publish_status(req, layer_or_map, layer_or_map_id):
     model = Map if layer_or_map == 'map' else Layer
     obj = _resolve_object(req, model, 'mapstory.change_publishingstatus',
                           allow_owner=True, id=layer_or_map_id)
-    
-    if not req.user.is_superuser:
+
+    status = req.POST['status']
+
+    # allow superuser to fix stuff no matter and we'll allow junk in Private
+    if not req.user.is_superuser and status != 'Private':
         # verify metadata is completed or reject
         if isinstance(obj, Layer):
             layers = [obj]
@@ -255,12 +284,13 @@ def publish_status(req, layer_or_map, layer_or_map_id):
         for l in layers:
             if not models.audit_layer_metadata(l):
                 return HttpResponse('META', status=200)
-                          
-    models.PublishingStatus.objects.set_status(obj, req.POST['status'])
+
+    models.PublishingStatus.objects.set_status(obj, status)
     # this updates status of the current user's layers unless admin (does all)
     obj.publish.update_related(ignore_owner=req.user.is_superuser)
-        
+
     return HttpResponse('OK', status=200)
+
 
 @login_required
 def add_to_map(req,id,typename):
@@ -436,6 +466,8 @@ def upload_style(req):
         return respond(errors="The uploaded SLD file is not valid XML")
     
     el = dom.findall("{http://www.opengis.net/sld}NamedLayer/{http://www.opengis.net/sld}Name")
+    if len(el) == 0 and not data.get('name'):
+        return respond(errors="Please provide a name, unable to extract one from the SLD.")
     name = data.get('name') or el[0].text
     if data['update']:
         match = None

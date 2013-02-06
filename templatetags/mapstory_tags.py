@@ -1,5 +1,6 @@
 from django import template
 from django.template import loader
+from django.core.exceptions import ObjectDoesNotExist
 from django.core.paginator import Page
 from django.core.urlresolvers import reverse
 from django.contrib.auth.models import User
@@ -346,6 +347,18 @@ def manual_include(path):
 
 
 @register.simple_tag
+def profile_incomplete(user):
+    try:
+        incomplete = getattr(user, 'profileincomplete', None)
+    except ObjectDoesNotExist:
+        incomplete = None
+    if incomplete:
+        return loader.render_to_string('mapstory/_profile_incomplete.html',
+                                   {'incomplete' : incomplete})
+    return ''
+
+
+@register.simple_tag
 def warn_status(req, obj):
     if req.user.is_authenticated() and obj.publish.status == PUBLISHING_STATUS_PRIVATE:
         return loader.render_to_string('maps/_warn_status.html', {})
@@ -368,7 +381,13 @@ def pagination(pager, url_name, *args):
 
 @register.simple_tag
 def user_activity_email_prefs(user):
-    return loader.render_to_string('mapstory/user_activity_email_prefs.html',{'user': user})
+    active = user.useractivity.notification_preference.lower() + 'active'
+    ctx = {'user' : user, active: 'active'}
+    return loader.render_to_string('mapstory/user_activity_email_prefs.html', ctx)
+
+@register.inclusion_tag('mapstory/_announcements.html', takes_context=True)
+def mapstory_announcements(context):
+    return context
 
 # @todo - make geonode location play better
 if settings.GEONODE_CLIENT_LOCATION.startswith("http"):

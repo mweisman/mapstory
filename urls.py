@@ -86,6 +86,7 @@ urlpatterns += patterns('mapstory.views',
     url(r'^mapstory/section/(?P<section>[-\w]+)/tiles$','section_tiles',name='section_tiles'),
     url(r'^mapstory/resource/(?P<resource>[-\w]+)$','resource_detail',name='mapstory_resource'),
     url(r'^mapstory/how-to$','how_to',name='how_to'),
+    url(r'^mapstory/reflections$','reflections',name='reflections'),
     url(r'^mapstory/manual$','manual',name='mapstory_manual'),
     url(r'^mapstory/admin-manual$','admin_manual',name='mapstory_admin_manual'),
     url(r'^mapstory/by_storyteller_pager/(?P<user>\S+)/(?P<what>\S+)$','by_storyteller_pager',name='by_storyteller_pager'),
@@ -106,6 +107,8 @@ urlpatterns += patterns('mapstory.views',
     url(r'^search/favoriteslist$','favoriteslist',name='favoriteslist'),
 
     url(r'^ajax/hitcount/$', update_hit_count_ajax, name='hitcount_update_ajax'),
+
+    url(r"^announcements/", include("announcements.urls")),
 
     # for now, direct-to-template but should be in database
     url(r"^mapstory/thoughts/jonathan-marino", direct_to_template, {"template": "mapstory/thoughts.html",
